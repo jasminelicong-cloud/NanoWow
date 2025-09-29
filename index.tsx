@@ -6,7 +6,26 @@
 
 import { GoogleGenAI, Modality } from '@google/genai';
 
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+const GOOGLE_API_KEY = process.env.API_KEY || '';
+const THIRD_PARTY_API_KEY = process.env.THIRD_PARTY_API_KEY || '';
+const RAW_THIRD_PARTY_BASE_URL = process.env.THIRD_PARTY_BASE_URL || process.env.THIRD_PARTY_API_BASE_URL || '';
+const THIRD_PARTY_MODEL_NAME = process.env.THIRD_PARTY_MODEL_NAME || process.env.THIRD_PARTY_MODEL || '';
+
+const NORMALIZED_THIRD_PARTY_BASE_URL = RAW_THIRD_PARTY_BASE_URL
+  ? RAW_THIRD_PARTY_BASE_URL.replace(/\/?$/, '')
+  : '';
+
+const IS_THIRD_PARTY_ENABLED = Boolean(
+  THIRD_PARTY_API_KEY && NORMALIZED_THIRD_PARTY_BASE_URL && THIRD_PARTY_MODEL_NAME
+);
+
+const THIRD_PARTY_ENDPOINT = IS_THIRD_PARTY_ENABLED
+  ? `${NORMALIZED_THIRD_PARTY_BASE_URL}/chat/completions`
+  : '';
+
+const ai = !IS_THIRD_PARTY_ENABLED && GOOGLE_API_KEY
+  ? new GoogleGenAI({ apiKey: GOOGLE_API_KEY })
+  : null;
 
 const STYLES = [
     {
@@ -141,8 +160,159 @@ function setSelectedImage(image: GeneratedImage | null) {
     render();
 }
 
+function parseImageReference(text: string): string | null {
+    const dataUrlMatch = text.match(/data:image\/[a-zA-Z0-9+._-]+;base64,[A-Za-z0-9+/=]+/);
+    if (dataUrlMatch) return dataUrlMatch[0];
+    const urlMatch = text.match(/https?:\/\/[^\s"']+\.(?:png|jpe?g|gif|webp)/i);
+    if (urlMatch) return urlMatch[0];
+    const base64Match = text.match(/[A-Za-z0-9+/]{200,}={0,2}/);
+    if (base64Match) return `data:image/png;base64,${base64Match[0]}`;
+    return null;
+}
+
+function extractImageFromContent(content: unknown): string | null {
+    if (!content) return null;
+    if (typeof content === 'string') {
+        return parseImageReference(content);
+    }
+    if (Array.isArray(content)) {
+        for (const item of content) {
+            const extracted = extractImageFromContent(item);
+            if (extracted) return extracted;
+        }
+        return null;
+    }
+    if (typeof content === 'object') {
+        const candidate = content as Record<string, unknown>;
+        if (typeof candidate.image_base64 === 'string') {
+            return `data:image/png;base64,${candidate.image_base64}`;
+        }
+        if (typeof candidate.b64_json === 'string') {
+            return `data:image/png;base64,${candidate.b64_json}`;
+        }
+        if (typeof candidate.data === 'string') {
+            return `data:image/png;base64,${candidate.data}`;
+        }
+        if (typeof candidate.url === 'string') {
+            return candidate.url;
+        }
+        if (typeof candidate.image_url === 'string') {
+            return candidate.image_url;
+        }
+        if (candidate.image_url && typeof (candidate.image_url as { url?: string }).url === 'string') {
+            return (candidate.image_url as { url: string }).url;
+        }
+        if (typeof candidate.text === 'string') {
+            return parseImageReference(candidate.text);
+        }
+        if (candidate.content) {
+            const nested = extractImageFromContent(candidate.content);
+            if (nested) return nested;
+        }
+        if (Array.isArray(candidate.images) && candidate.images.length > 0) {
+            return extractImageFromContent(candidate.images[0]);
+        }
+    }
+    return null;
+}
+
+function extractImageFromThirdPartyResponse(response: unknown): string | null {
+    const payload = response as Record<string, unknown> | undefined;
+    if (!payload) return null;
+
+    if (Array.isArray((payload as { data?: unknown }).data)) {
+        const dataEntries = (payload as { data: Array<Record<string, unknown>> }).data;
+        if (dataEntries.length > 0) {
+            const directData = extractImageFromContent(dataEntries[0]);
+            if (directData) return directData;
+        }
+    }
+
+    if (Array.isArray((payload as { choices?: unknown }).choices)) {
+        const choices = (payload as { choices: Array<Record<string, unknown>> }).choices;
+        for (const choice of choices) {
+            if (!choice) continue;
+            const message = choice.message as Record<string, unknown> | undefined;
+            const fromMessage = extractImageFromContent(message?.content ?? message);
+            if (fromMessage) return fromMessage;
+        }
+    }
+
+    return null;
+}
+
+async function generateThirdPartyImage(prompt: string, title: string, originalImage: UploadedImage): Promise<GeneratedImage | null> {
+    if (!IS_THIRD_PARTY_ENABLED || !THIRD_PARTY_ENDPOINT) {
+        return null;
+    }
+
+    const imageDataUrl = originalImage.base64.startsWith('data:')
+        ? originalImage.base64
+        : `data:${originalImage.mimeType};base64,${originalImage.base64}`;
+
+    const payload = {
+        model: THIRD_PARTY_MODEL_NAME,
+        stream: false,
+        messages: [
+            {
+                role: 'user',
+                content: [
+                    { type: 'text', text: prompt },
+                    {
+                        type: 'image_url',
+                        image_url: {
+                            url: imageDataUrl,
+                        },
+                    },
+                ],
+            },
+        ],
+    };
+
+    try {
+        const response = await fetch(THIRD_PARTY_ENDPOINT, {
+            method: 'POST',
+            headers: {
+                Authorization: `Bearer ${THIRD_PARTY_API_KEY}`,
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(payload),
+        });
+
+        if (!response.ok) {
+            throw new Error(`Third-party API returned ${response.status}`);
+        }
+
+        const result = await response.json();
+        const imageSrc = extractImageFromThirdPartyResponse(result);
+
+        if (!imageSrc) {
+            console.warn('Third-party API responded without an image payload.', result);
+            return null;
+        }
+
+        return {
+            src: imageSrc,
+            title,
+            prompt,
+        };
+    } catch (error) {
+        console.error(`Third-party image generation failed for "${title}":`, error);
+        return null;
+    }
+}
+
 async function generateSingleImage(prompt: string, title: string, originalImage: UploadedImage): Promise<GeneratedImage | null> {
     try {
+        if (IS_THIRD_PARTY_ENABLED) {
+            return await generateThirdPartyImage(prompt, title, originalImage);
+        }
+
+        if (!ai) {
+            console.error('Google Gemini API key missing; no third-party configuration detected.');
+            return null;
+        }
+
         const imagePart = {
             inlineData: {
                 data: originalImage.base64.split(',')[1],
